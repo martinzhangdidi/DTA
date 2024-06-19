@@ -1,0 +1,312 @@
+import pymysql
+import json
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
+import pymysql
+import json
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+import torch
+
+def create_connection():
+    try:
+        connection = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='zhangdi168',
+            database='DTA'
+        )
+        print("Database connection successful")
+        return connection
+    except Exception as e:
+        print(f"Database connection failed: {e}")
+        raise
+
+class DTADataset(Dataset):
+    def __init__(self, data_indices):
+        self.data_indices = data_indices
+
+    def __len__(self):
+        return len(self.data_indices)
+
+    def __getitem__(self, idx):
+        connection = create_connection()
+        try:
+            batch_indices = self.data_indices[idx]
+
+            med_graphs = []
+            protein_graphs = []
+            affinities = []
+
+            with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                query = "SELECT medGraph, protein_proteinGraph, Affinity FROM kiba_protein_view WHERE id = %s"
+                cursor.execute(query, (batch_indices,))
+                row = cursor.fetchone()
+
+                if row:
+                    try:
+                        med_graph = json.loads(row['medGraph'])
+                        protein_graph = json.loads(row['protein_proteinGraph'])
+                        affinity = row['Affinity']
+
+                        med_graph_tensor = {k: torch.tensor(v, dtype=torch.float32) for k, v in med_graph.items() if isinstance(v, (list, int, float))}
+                        protein_graph_tensor = {k: torch.tensor(v, dtype=torch.float32) for k, v in protein_graph.items() if isinstance(v, (list, int, float))}
+
+                        return med_graph_tensor, protein_graph_tensor, torch.tensor(affinity, dtype=torch.float32)
+                    except json.JSONDecodeError as e:
+                        print(f"Error decoding JSON: {e}")
+
+            return None, None, None
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            return None, None, None
+        finally:
+            connection.close()
+
+# 从数据库中读取所有数据的索引
+def read_data_indices():
+    connection = create_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM kiba_protein_view")
+            rows = cursor.fetchall()
+            data_indices = [row[0] for row in rows]  # 访问元组的第一个元素
+        return data_indices
+    except Exception as e:
+        print(f"Error reading data indices: {e}")
+        return []
+    finally:
+        connection.close()
+
+data_indices = read_data_indices()
+
+# 确保 data_indices 不为空
+if len(data_indices) == 0:
+    raise ValueError("No data indices found. Ensure the database table is not empty.")
+
+# 将数据集划分为训练集和测试集，以5:1的比例划分
+train_indices, test_indices = train_test_split(data_indices, test_size=1/6, random_state=42)
+
+print(f"Total data indices: {len(data_indices)}")
+print(f"Training set size: {len(train_indices)}")
+print(f"Test set size: {len(test_indices)}")
+
+# 创建数据集和数据加载器
+train_dataset = DTADataset(train_indices)
+test_dataset = DTADataset(test_indices)
+
+train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+class GNNLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GNNLayer, self).__init__()
+        self.fc = nn.Linear(in_features, out_features)
+    
+    def forward(self, x, adj):
+        out = torch.matmul(adj, x)
+        out = self.fc(out)
+        return out
+
+class ConformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, ff_mult=4):
+        super(ConformerBlock, self).__init__()
+        self.self_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult),
+            nn.ReLU(),
+            nn.Linear(dim * ff_mult, dim)
+        )
+    
+    def forward(self, x):
+        attn_output, _ = self.self_attn(x, x, x)
+        x = x + attn_output
+        x = x + self.ffn(x)
+        return x
+
+class GNNModel(nn.Module):
+    def __init__(self, num_features, hidden_dim, output_dim):
+        super(GNNModel, self).__init__()
+        self.med_embedding = nn.Linear(num_features, 128)  # 药物嵌入层，大小为128
+        self.protein_embedding = nn.Linear(num_features, 128)  # 蛋白质嵌入层，大小为128
+
+        self.med_gnn1 = GNNLayer(128, hidden_dim)
+        self.med_gnn2 = GNNLayer(hidden_dim, hidden_dim)
+        self.med_gnn3 = GNNLayer(hidden_dim, hidden_dim)
+        
+        self.protein_gnn1 = GNNLayer(128, hidden_dim)
+        self.protein_gnn2 = GNNLayer(hidden_dim, hidden_dim)
+        self.protein_gnn3 = GNNLayer(hidden_dim, hidden_dim)
+
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.conformer_blocks = nn.ModuleList([ConformerBlock(hidden_dim, num_heads=4) for _ in range(3)])
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4)
+        self.fc1 = nn.Linear(hidden_dim * 2, 512)
+        self.fc2 = nn.Linear(512, 1)
+
+    def forward(self, med_graph, protein_graphs):
+        # 药物图特征提取
+        med_x, med_adj = med_graph['atoms'], med_graph['adjacency_matrix']
+        med_x = torch.tensor(med_x, dtype=torch.float32)
+        med_adj = torch.tensor(med_adj, dtype=torch.float32)
+        
+        med_x = self.med_embedding(med_x)
+        med_x = self.med_gnn1(med_x, med_adj)
+        med_x = self.med_gnn2(med_x, med_adj)
+        med_x = self.med_gnn3(med_x, med_adj)
+        med_x = med_x.mean(dim=0)  # Graph pooling
+        
+        # 蛋白质图特征提取
+        protein_embeddings = []
+        for protein_graph in protein_graphs:
+            protein_x, protein_adj = protein_graph['atoms'], protein_graph['adjacency_matrix']
+            protein_x = torch.tensor(protein_x, dtype=torch.float32)
+            protein_adj = torch.tensor(protein_adj, dtype=torch.float32)
+            
+            protein_x = self.protein_embedding(protein_x)
+            protein_x = self.protein_gnn1(protein_x, protein_adj)
+            protein_x = self.protein_gnn2(protein_x, protein_adj)
+            protein_x = self.protein_gnn3(protein_x, protein_adj)
+            protein_x = protein_x.mean(dim=0)  # Graph pooling
+            
+            for conformer in self.conformer_blocks:
+                protein_x = conformer(protein_x.unsqueeze(1)).squeeze(1)
+                
+            protein_embeddings.append(protein_x)
+        
+        protein_embeddings = torch.stack(protein_embeddings, dim=0)
+        attn_output, _ = self.attention(protein_embeddings, protein_embeddings, protein_embeddings)
+        attn_output = attn_output.mean(dim=0)  # Weighted sum
+        
+        combined_x = torch.cat([med_x, attn_output], dim=0)
+        x = self.fc1(combined_x)
+        x = self.fc2(x)
+        
+        return x
+
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+
+model = GNNModel(num_features=5, hidden_dim=128, output_dim=1).to(device)  # 假设每个原子的特征有5个
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0005)  # 学习率设置为0.0005
+
+def save_model(model, path):
+    torch.save(model.state_dict(), path)
+
+def load_model(model, path):
+    model.load_state_dict(torch.load(path))
+    model.eval()
+    return model
+
+# 创建 TensorBoard writer
+writer = SummaryWriter('runs/gnn_experiment_1')
+
+def train(model, train_dataloader, test_dataloader, criterion, optimizer, num_epochs=1000, save_path='gnn_model.pth'):
+    model.train()
+    train_losses = []
+    test_losses = []
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for med_graphs, protein_graphs, affinities in train_dataloader:
+            optimizer.zero_grad()
+            batch_loss = 0.0
+            for med_graph, protein_graph, affinity in zip(med_graphs, protein_graphs, affinities):
+                med_graph = {k: torch.tensor(v).to(device) for k, v in med_graph.items()}
+                protein_graph = [{k: torch.tensor(v).to(device) for k, v in graph.items()} for graph in protein_graph]
+                outputs = model(med_graph, protein_graph)
+                affinity = torch.tensor([affinity], dtype=torch.float32).to(device)
+                loss = criterion(outputs, affinity)
+                loss.backward()
+                optimizer.step()
+                batch_loss += loss.item()
+            running_loss += batch_loss
+        
+        epoch_loss = running_loss / len(train_dataloader)
+        train_losses.append(epoch_loss)
+        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {epoch_loss:.4f}')
+        writer.add_scalar('Loss/train', epoch_loss, epoch)
+        
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 在测试集上计算损失
+model.eval()
+test_loss = 0.0
+test_losses = []  # 确保定义了 test_losses 列表
+
+with torch.no_grad():
+    for med_graphs, protein_graphs, affinities in test_dataloader:
+        batch_loss = 0.0
+        for med_graph, protein_graph, affinity in zip(med_graphs, protein_graphs, affinities):
+            try:
+                # 打印调试信息以检查数据格式
+                #print(f"Processing med_graph: {med_graph}")
+                #print(f"med_graph type: {type(med_graph)}, med_graph keys: {med_graph.keys()}")
+                #print(f"Processing protein_graph: {protein_graph}")
+
+                # 转换 med_graph
+                med_graph_processed = {}
+                for k, v in med_graph.items():
+                    if isinstance(v, dict):
+                        raise ValueError(f"Unexpected dict in med_graph at key {k}")
+                    med_graph_processed[k] = v.to(device)
+                    print(f"med_graph_processed[{k}] type: {type(med_graph_processed[k])}, shape: {med_graph_processed[k].shape}")
+
+                # 转换 protein_graph
+                protein_graph_processed = []
+                for graph in protein_graph:
+                    graph_processed = {}
+                    for k, v in graph.items():
+                        if isinstance(v, dict):
+                            raise ValueError(f"Unexpected dict in protein_graph at key {k}")
+                        graph_processed[k] = v.to(device)
+                        print(f"protein_graph_processed[{k}] type: {type(graph_processed[k])}, shape: {graph_processed[k].shape}")
+                    protein_graph_processed.append(graph_processed)
+                
+                # 进行前向传播
+                outputs = model(med_graph_processed, protein_graph_processed)
+                print(f"outputs type: {type(outputs)}, shape: {outputs.shape}")
+
+                # 转换 affinity
+                affinity = affinity.to(device)
+                print(f"affinity type: {type(affinity)}, shape: {affinity.shape}")
+
+                # 计算损失
+                loss = criterion(outputs, affinity)
+                print(f"loss: {loss.item()}")
+
+                batch_loss += loss.item()
+            except Exception as e:
+                print(f"Error processing batch: {e}")
+                continue
+        test_loss += batch_loss
+
+test_loss /= len(test_dataloader)
+test_losses.append(test_loss)
+print(f'Test Loss: {test_loss:.4f}')
+writer.add_scalar('Loss/test', test_loss, epoch)
+
+# 切换回训练模式
+model.train()
+
+# 每个 epoch 结束后保存模型
+save_model(model, save_path)
+
+writer.close()
+
+# 绘制损失曲线
+plt.figure(figsize=(10, 5))
+plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+plt.plot(range(1, len(test_losses) + 1), test_losses, label='Test Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Training and Test Loss Over Epochs')
+plt.legend()
+plt.show()
