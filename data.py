@@ -8,7 +8,13 @@ def load_data(filepath):
             parts = line.strip().split(' ')
             if len(parts) == 5:
                 data.append(parts)
-    return pd.DataFrame(data, columns=columns)
+    df = pd.DataFrame(data, columns=columns)
+    
+    # 只保留前 85% 的数据
+    cutoff = int(len(df) * 0.85)
+    df = df.iloc[:cutoff]
+    
+    return df
 
 if __name__ == "__main__":
     df = load_data('data/kiba.txt')

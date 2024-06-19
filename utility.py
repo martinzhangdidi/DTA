@@ -78,7 +78,8 @@ def process_and_convert_to_tensors(smiles, sequence, affinity, max_length=1000, 
             ngram_atoms_adj.append((atoms, adj))
         else:
             ngram_atoms_adj.append((None, None))
-    
+       # 清理中间结果，释放内存
+    del mol_graph, ngram_graphs
     return (mol_atoms, mol_adj), ngram_atoms_adj, affinity
 
 if __name__ == "__main__":

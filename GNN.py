@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.nn as pyg_nn
+import gc  # 导入垃圾回收模块
+
 
 # 定义一个图卷积层，结合卷积操作和线性变换
 class LEConvLayer(nn.Module):
